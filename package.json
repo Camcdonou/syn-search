@@ -1,0 +1,19 @@
+{
+  "name": "pi-synthetic-search",
+  "version": "1.0.0",
+  "description": "Pi extension that adds web search using Synthetic's Search API",
+  "license": "MIT",
+  "keywords": [
+    "pi-package"
+  ],
+  "pi": {
+    "extensions": ["./extensions"]
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-ai": "*",
+    "@mariozechner/pi-tui": "*",
+    "@mariozechner/pi-agent-core": "*",
+    "@sinclair/typebox": "*"
+  }
+}
