@@ -3,9 +3,10 @@
  *
  * Adds a web search tool and command using Synthetic's Search API.
  * The LLM can control result detail via `detail_level`:
- *   - "summary"  → title + URL + date only (~50 tokens/result)
- *   - "snippet"  → + 300-char text excerpt (default, ~100 tokens/result)
- *   - "full"     → complete untruncated text (LLM opts in for deep reads)
+ *   - "summary"     → title + URL + date only (~50 tokens/result)
+ *   - "snippet"     → + 300-char text excerpt (~100 tokens/result)
+ *   - "ai-summary"   → full text sent to AI summarizer with optional focus prompt
+ *   - "full"         → complete untruncated text (LLM opts in for deep reads)
  *
  * Output is truncated at 2000 lines / 50KB as a safety net. When truncated,
  * full output is saved to a temp file and the LLM is told to use `read` on it.
@@ -33,14 +34,20 @@ import { Type } from "@sinclair/typebox";
 // Types
 // ---------------------------------------------------------------------------
 
-const DETAIL_LEVELS = ["summary", "snippet", "full"] as const;
+const DETAIL_LEVELS = ["summary", "snippet", "full", "ai-summary"] as const;
 
 const TOOL_PARAMS = Type.Object({
 	query: Type.String({ description: "Search query terms" }),
 	detail_level: Type.Optional(
 		StringEnum(DETAIL_LEVELS, {
 			description:
-				"Result detail: 'summary' = title+URL only, 'snippet' = +300-char text (default), 'full' = complete text. Use 'full' when you need full context from results.",
+				"Result detail: 'summary' = title+URL only, 'snippet' = +300-char text, 'ai-summary' = AI-summarized with optional focus prompt (default for real questions), 'full' = complete text. Use 'ai-summary' when you need substantive information, provide summary_prompt to focus the summarizer.",
+		}),
+	),
+	summary_prompt: Type.Optional(
+		Type.String({
+			description:
+				"Context/instructions for the AI summarizer. When detail_level is 'ai-summary', this tells the summarizer what to focus on based on the conversation context. If omitted, the summarizer uses the query alone.",
 		}),
 	),
 	max_results: Type.Optional(
@@ -52,9 +59,12 @@ const TOOL_PARAMS = Type.Object({
 	),
 });
 
+type DetailLevel = "summary" | "snippet" | "full" | "ai-summary";
+
 type ToolParams = {
 	query: string;
-	detail_level?: "summary" | "snippet" | "full";
+	detail_level?: DetailLevel;
+	summary_prompt?: string;
 	max_results?: number;
 };
 
@@ -67,11 +77,13 @@ interface SearchResult {
 
 interface SyntheticSearchDetails {
 	query: string;
-	detailLevel: "summary" | "snippet" | "full";
+	detailLevel: DetailLevel;
 	resultCount: number;
 	totalAvailable: number;
 	truncation?: TruncationResult;
 	fullOutputPath?: string;
+	summaryPrompt?: string;
+	summarizerUsage?: { promptTokens: number; completionTokens: number };
 }
 
 // ---------------------------------------------------------------------------
@@ -79,9 +91,17 @@ interface SyntheticSearchDetails {
 // ---------------------------------------------------------------------------
 
 const SYNTHETIC_ENDPOINT = "https://api.synthetic.new/v2/search";
+const SYNTHETIC_CHAT_ENDPOINT = "https://api.synthetic.new/v1/chat/completions";
 const DEFAULT_DETAIL_LEVEL = "snippet";
 const DEFAULT_MAX_RESULTS = 5;
 const SNIPPET_MAX_CHARS = 300;
+
+// Summarizer config
+const SUMMARIZER_MODEL = "hf:zai-org/GLM-4.7-Flash";
+const SUMMARIZER_MAX_TOKENS = 1000;
+const SUMMARIZER_REASONING_EFFORT = "low";
+const SUMMARIZER_SYSTEM_PROMPT =
+	"You are a search result summarizer. Given search results and optional user context, extract the specific information that is most relevant to the query. Be concise but complete. Include code snippets if present. If information is missing from the results, say so rather than guessing.";
 
 function truncateSnippet(text: string, maxChars: number): string {
 	if (text.length <= maxChars) return text;
@@ -106,7 +126,7 @@ function formatDate(iso?: string): string {
 function formatResult(
 	result: SearchResult,
 	index: number,
-	detailLevel: "summary" | "snippet" | "full",
+	detailLevel: DetailLevel,
 ): string {
 	let text = `${index + 1}. **${result.title}**\n`;
 	text += `   URL: ${result.url}\n`;
@@ -114,7 +134,7 @@ function formatResult(
 
 	if (detailLevel === "snippet" && result.text) {
 		text += `\n   > ${truncateSnippet(result.text, SNIPPET_MAX_CHARS)}`;
-	} else if (detailLevel === "full" && result.text) {
+	} else if ((detailLevel === "full" || detailLevel === "ai-summary") && result.text) {
 		text += `\n   > ${result.text}`;
 	}
 
@@ -125,7 +145,7 @@ function formatOutput(
 	query: string,
 	results: SearchResult[],
 	totalAvailable: number,
-	detailLevel: "summary" | "snippet" | "full",
+	detailLevel: DetailLevel,
 ): string {
 	const lines: string[] = [];
 	lines.push(`Search results for "${query}" (${results.length} of ${totalAvailable} results, detail: ${detailLevel}):`);
@@ -139,6 +159,102 @@ function formatOutput(
 	return lines.join("\n");
 }
 
+function formatResultsForSummarizer(results: SearchResult[]): string {
+	const lines: string[] = [];
+	for (const r of results) {
+		lines.push(`Title: ${r.title}`);
+		lines.push(`URL: ${r.url}`);
+		if (r.published) lines.push(`Published: ${formatDate(r.published)}`);
+		lines.push(`Content: ${r.text}`);
+		lines.push("---");
+	}
+	return lines.join("\n");
+}
+
+async function summarizeResults(
+	query: string,
+	formattedResults: string,
+	summaryPrompt: string | undefined,
+	apiKey: string,
+	signal?: AbortSignal,
+): Promise<{ summary: string; usage: { promptTokens: number; completionTokens: number } }> {
+	let userContent = `Search query: ${query}\n\n`;
+	if (summaryPrompt) {
+		userContent += `User context: ${summaryPrompt}\n\n`;
+	}
+	userContent += `Search results:\n${formattedResults}\n\nExtract the information most relevant to the query${summaryPrompt ? " and user context" : ""}. Focus on actionable details, code snippets, and specific facts.`;
+
+	let response: Response;
+	try {
+		response = await fetch(SYNTHETIC_CHAT_ENDPOINT, {
+			method: "POST",
+			headers: {
+				Authorization: `Bearer ${apiKey}`,
+				"Content-Type": "application/json",
+			},
+			body: JSON.stringify({
+				model: SUMMARIZER_MODEL,
+				max_tokens: SUMMARIZER_MAX_TOKENS,
+				temperature: 0.3,
+				reasoning_effort: SUMMARIZER_REASONING_EFFORT,
+				messages: [
+					{ role: "system", content: SUMMARIZER_SYSTEM_PROMPT },
+					{ role: "user", content: userContent },
+				],
+			}),
+			signal,
+		});
+	} catch (err) {
+		if ((err as Error).name === "AbortError") {
+			throw new Error("Summarization request was cancelled.");
+		}
+		throw new Error(
+			`Summarizer network error: ${(err as Error).message}. Check your internet connection.`,
+		);
+	}
+
+	if (!response.ok) {
+		const errorBody = await response.text().catch(() => "");
+		switch (response.status) {
+			case 401:
+				throw new Error(
+					`Summarizer API returned 401 Unauthorized. Check your SYNTHETIC_API_KEY. ${errorBody}`,
+				);
+			case 429:
+				throw new Error(
+					`Summarizer API rate limit exceeded (429). Wait a moment and try again. ${errorBody}`,
+				);
+			default:
+				throw new Error(
+					`Summarizer API request failed (${response.status}): ${errorBody || response.statusText}`,
+				);
+		}
+	}
+
+	let data: {
+		choices?: Array<{ message?: { content?: string | null } }>;
+		usage?: { prompt_tokens?: number; completion_tokens?: number };
+	};
+	try {
+		data = (await response.json()) as typeof data;
+	} catch {
+		throw new Error("Summarizer API returned invalid JSON.");
+	}
+
+	const content = data.choices?.[0]?.message?.content;
+	if (!content) {
+		throw new Error("Summarizer returned empty content. Try again with detail_level='full'.");
+	}
+
+	return {
+		summary: content,
+		usage: {
+			promptTokens: data.usage?.prompt_tokens ?? 0,
+			completionTokens: data.usage?.completion_tokens ?? 0,
+		},
+	};
+}
+
 // ---------------------------------------------------------------------------
 // Extension
 // ---------------------------------------------------------------------------
@@ -149,11 +265,12 @@ export default function syntheticSearchExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "synthetic_search",
 		label: "Synthetic Search",
-		description: `Search the web via Synthetic's Search API. Returns top results with titles, URLs, and text snippets. Use detail_level='full' for complete text. Output truncated to ${DEFAULT_MAX_LINES} lines or ${formatSize(DEFAULT_MAX_BYTES)}; full output saved to temp file when exceeded.`,
+		description: `Search the web via Synthetic's Search API. Returns top results with titles, URLs, and text snippets. Use detail_level='ai-summary' (recommended for real questions) to get AI-summarized results with an optional summary_prompt to focus on what matters. Use 'full' for complete text. Output truncated to ${DEFAULT_MAX_LINES} lines or ${formatSize(DEFAULT_MAX_BYTES)}; full output saved to temp file when exceeded.`,
 		promptSnippet: "Search the web for information using Synthetic Search",
 		promptGuidelines: [
 			"Use this tool when you need to find current information on the web.",
-			"Use detail_level='summary' for quick overview, 'snippet' (default) for balanced results, or 'full' for complete text.",
+			"Use detail_level='ai-summary' when you need substantive information from search results. Provide summary_prompt to focus the summarizer on what's relevant to the conversation context.",
+			"Use detail_level='snippet' for quick relevance checks, or 'summary' to just check if anything exists.",
 			"If output is truncated, use the read tool on the temp file path shown in the truncation notice to see full results.",
 		],
 		parameters: TOOL_PARAMS,
@@ -247,10 +364,71 @@ export default function syntheticSearchExtension(pi: ExtensionAPI) {
 				};
 			}
 
-			// --- Tier 2: format with detail_level (per-result truncation happens inside formatResult) ---
+			// --- ai-summary path: send full results to summarizer ---
+			if (detailLevel === "ai-summary") {
+				// Stream progress: summarizing
+				onUpdate?.({
+					content: [{ type: "text", text: `Summarizing ${results.length} results...` }],
+				});
+
+				const formattedForSummarizer = formatResultsForSummarizer(results);
+				const { summary, usage } = await summarizeResults(
+					query,
+					formattedForSummarizer,
+					params.summary_prompt,
+					apiKey,
+					signal,
+				);
+
+				// Format the AI summary as the output
+				const formatted = `AI Summary for "${query}" (${results.length} of ${totalAvailable} results, detail: ai-summary):\n\n${summary}`;
+
+				// Overall truncation (safety net — summaries should be well under limits)
+				const truncation = truncateHead(formatted, {
+					maxLines: DEFAULT_MAX_LINES,
+					maxBytes: DEFAULT_MAX_BYTES,
+				});
+
+				const details: SyntheticSearchDetails = {
+					query,
+					detailLevel: "ai-summary",
+					resultCount: results.length,
+					totalAvailable,
+					summaryPrompt: params.summary_prompt,
+					summarizerUsage: usage,
+				};
+
+				let resultText = truncation.content;
+
+				if (truncation.truncated) {
+					const tempDir = await mkdtemp(join(tmpdir(), "pi-synthetic-"));
+					const tempFile = join(tempDir, "search-results.txt");
+					await withFileMutationQueue(tempFile, async () => {
+						await writeFile(tempFile, formatted, "utf8");
+					});
+
+					details.truncation = truncation;
+					details.fullOutputPath = tempFile;
+
+					const truncatedLines = truncation.totalLines - truncation.outputLines;
+					const truncatedBytes = truncation.totalBytes - truncation.outputBytes;
+
+					resultText += `\n\n[Output truncated: showing ${truncation.outputLines} of ${truncation.totalLines} lines`;
+					resultText += ` (${formatSize(truncation.outputBytes)} of ${formatSize(truncation.totalBytes)}).`;
+					resultText += ` ${truncatedLines} lines (${formatSize(truncatedBytes)}) omitted.`;
+					resultText += ` Full output saved to: ${tempFile} — use the read tool to view it.]`;
+				}
+
+				return {
+					content: [{ type: "text", text: resultText }],
+					details,
+				};
+			}
+
+			// --- Standard path: format with detail_level (per-result truncation happens inside formatResult) ---
 			const formatted = formatOutput(query, results, totalAvailable, detailLevel);
 
-			// --- Tier 3: overall output truncation (safety net) ---
+			// --- Overall output truncation (safety net) ---
 			const truncation = truncateHead(formatted, {
 				maxLines: DEFAULT_MAX_LINES,
 				maxBytes: DEFAULT_MAX_BYTES,
@@ -299,6 +477,10 @@ export default function syntheticSearchExtension(pi: ExtensionAPI) {
 			if (args.detail_level && args.detail_level !== DEFAULT_DETAIL_LEVEL) {
 				text += theme.fg("dim", ` (${args.detail_level})`);
 			}
+			if (args.summary_prompt) {
+				const shortPrompt = args.summary_prompt.length > 50 ? args.summary_prompt.slice(0, 47) + "..." : args.summary_prompt;
+				text += theme.fg("dim", ` 🎯 [focus: ${shortPrompt}]`);
+			}
 			if (args.max_results && args.max_results !== DEFAULT_MAX_RESULTS) {
 				text += theme.fg("dim", ` max:${args.max_results}`);
 			}
@@ -309,7 +491,8 @@ export default function syntheticSearchExtension(pi: ExtensionAPI) {
 			const details = result.details as SyntheticSearchDetails | undefined;
 
 			if (isPartial) {
-				return new Text(theme.fg("warning", "🔍 Searching..."), 0, 0);
+				const partialText = details?.detailLevel === "ai-summary" ? "🔍 Summarizing..." : "🔍 Searching...";
+				return new Text(theme.fg("warning", partialText), 0, 0);
 			}
 
 			if (!details) {
@@ -329,9 +512,15 @@ export default function syntheticSearchExtension(pi: ExtensionAPI) {
 			}
 
 			// Collapsed: compact summary
-			let text = theme.fg("success", `✓ ${details.resultCount} results`);
-			if (details.detailLevel !== DEFAULT_DETAIL_LEVEL) {
+			let text =
+				details.detailLevel === "ai-summary"
+					? theme.fg("success", `✓ summarized ${details.resultCount} results`)
+					: theme.fg("success", `✓ ${details.resultCount} results`);
+			if (details.detailLevel !== DEFAULT_DETAIL_LEVEL && details.detailLevel !== "ai-summary") {
 				text += theme.fg("dim", ` (${details.detailLevel})`);
+			}
+			if (details.detailLevel === "ai-summary" && details.summarizerUsage) {
+				text += theme.fg("dim", ` (${details.summarizerUsage.completionTokens} tokens)`);
 			}
 			if (details.truncation?.truncated) {
 				text += theme.fg("warning", " (truncated)");
