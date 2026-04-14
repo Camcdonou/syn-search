@@ -39,7 +39,7 @@ Add this to your `.zshrc` / `.bashrc` to persist it.
 **Option A — pi install (recommended)**
 
 ```bash
-pi install git:github.com/<username>/syn-search
+pi install git:github.com/Camcdonou/syn-search
 ```
 
 Restart pi or run `/reload`. That's it.
@@ -62,7 +62,7 @@ cp extensions/synthetic-search.ts .pi/extensions/
 **Option D — One-off test**
 
 ```bash
-pi -e git:github.com/<username>/syn-search
+pi -e git:github.com/Camcdonou/syn-search
 ```
 
 ## Usage
