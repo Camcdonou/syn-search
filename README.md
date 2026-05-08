@@ -227,7 +227,7 @@ All errors are thrown from `execute`, which sets `isError: true` in the tool res
 
 ## Requirements
 
-- [Pi](https://github.com/badlogic/pi-mono) (`npm install -g @mariozechner/pi-coding-agent`)
+- [Pi](https://github.com/badlogic/pi-mono) (`npm install -g @earendil-works/pi-coding-agent`)
 - A [Synthetic](https://synthetic.new) API key
 - Node.js 18+ (for built-in `fetch`)
 
