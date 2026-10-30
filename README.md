@@ -193,9 +193,19 @@ When `detail_level` is `ai-summary`:
 
 **Same API key** — both the search API and the summarizer use `SYNTHETIC_API_KEY`. No extra setup.
 
-**Model:** `GLM-4.7-Flash` — the cheapest and fastest model on Synthetic. Purpose-built for basic tasks like summarization. Not a reasoning model (we use `reasoning_effort: "low"` to skip the thinking step and get direct output).
+**Model:** `GLM-4.7-Flash` — the cheapest and fastest model on Synthetic. Purpose-built for basic tasks like summarization.
 
-**Cost:** ~$0.003 per summarization call (at $0.10/mtok input, $0.50/mtok output).
+**Thinking is disabled (`reasoning_effort: "none"`).** This is load-bearing, not an optimization. With thinking enabled, reasoning models on Synthetic spend the entire `max_tokens` budget on `reasoning_content`, return `finish_reason: "length"`, and hand back an **empty `content` string** — which is why `ai-summary` used to fail with `Summarizer returned empty content`. Sending `reasoning_effort: "none"` produces direct output at roughly 1/5 the completion tokens.
+
+**Cost:** ~$0.001 per summarization call (at $0.10/mtok input, $0.50/mtok output).
+
+### Tuning the summarizer
+
+| Env var | Default | Notes |
+|---|---|---|
+| `SYNTHETIC_SUMMARIZER_MODEL` | `hf:zai-org/GLM-4.7-Flash` | Use when a model is deprecated (`... is no longer supported`). |
+| `SYNTHETIC_SUMMARIZER_EFFORT` | `none` | `none` disables thinking. Set `omit` to send no `reasoning_effort` field (for models that reject `none`), or `low`/`medium`/`high` for reasoning-heavy summaries. |
+| `SYNTHETIC_SUMMARIZER_MAX_TOKENS` | `2000` | Capped at `8000`. Too low + thinking enabled is the classic empty-content trap. |
 
 **`summary_prompt`** is the key design choice. Without it, the summarizer only has the search query as context. With it, the main LLM can encode *why* it's searching and *what angle* matters:
 
@@ -221,9 +231,10 @@ This makes the summarizer a lightweight sub-agent — the main AI delegates rese
 | Network failure | Throws with connection guidance |
 | Empty results | Returns informational message (not an error) |
 | Request cancelled (Esc) | Throws `"Search request was cancelled."` or `"Summarization request was cancelled."` |
-| Summarizer returns empty content | Throws with fallback suggestion (`detail_level='full'`) |
+| Summarizer returns empty content | Retries once with thinking off and 2x tokens, then **falls back to full raw results** with a warning instead of failing the search |
+| Summarizer model deprecated / bad params (4xx) | Retries once with thinking omitted, then falls back to full raw results |
 
-All errors are thrown from `execute`, which sets `isError: true` in the tool result so the LLM knows the search failed and can react accordingly.
+Search errors are thrown from `execute`, which sets `isError: true` in the tool result so the LLM knows the search failed and can react accordingly. Summarizer errors do **not** fail the call — raw results are still useful, so the tool returns them with a `⚠ AI summary unavailable (...)` notice at the top of the output.
 
 ## Requirements
 

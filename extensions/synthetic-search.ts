@@ -84,6 +84,9 @@ interface SyntheticSearchDetails {
 	fullOutputPath?: string;
 	summaryPrompt?: string;
 	summarizerUsage?: { promptTokens: number; completionTokens: number };
+	summarizerModel?: string;
+	/** Set when ai-summary failed and we returned full results instead. */
+	summarizerFallback?: { error: string };
 }
 
 // ---------------------------------------------------------------------------
@@ -96,12 +99,44 @@ const DEFAULT_DETAIL_LEVEL = "snippet";
 const DEFAULT_MAX_RESULTS = 5;
 const SNIPPET_MAX_CHARS = 300;
 
-// Summarizer config
-const SUMMARIZER_MODEL = "hf:zai-org/GLM-4.7-Flash";
-const SUMMARIZER_MAX_TOKENS = 1000;
-const SUMMARIZER_REASONING_EFFORT = "low";
+// Summarizer config (overridable via env for model deprecations / tuning)
+const SUMMARIZER_DEFAULT_MODEL = "hf:zai-org/GLM-4.7-Flash";
+const SUMMARIZER_DEFAULT_MAX_TOKENS = 2000;
+/**
+ * "none" disables the thinking step. This matters: reasoning models on Synthetic
+ * otherwise spend the whole `max_tokens` budget on `reasoning_content`, finish with
+ * `finish_reason: "length"`, and return an empty `content` string.
+ * Use "omit" to send no `reasoning_effort` field at all (models that reject "none").
+ */
+const SUMMARIZER_DEFAULT_REASONING_EFFORT = "none";
+const SUMMARIZER_MAX_TOKENS_CEILING = 8000;
+/** Per-result and total caps so huge pages don't blow up cost/latency/context. */
+const SUMMARIZER_MAX_CHARS_PER_RESULT = 12_000;
+const SUMMARIZER_MAX_TOTAL_CHARS = 48_000;
 const SUMMARIZER_SYSTEM_PROMPT =
 	"You are a search result summarizer. Given search results and optional user context, extract the specific information that is most relevant to the query. Be concise but complete. Include code snippets if present. If information is missing from the results, say so rather than guessing.";
+
+interface SummarizerConfig {
+	model: string;
+	maxTokens: number;
+	/** undefined => omit the field entirely */
+	reasoningEffort: string | undefined;
+}
+
+function readSummarizerConfig(): SummarizerConfig {
+	const envModel = process.env.SYNTHETIC_SUMMARIZER_MODEL?.trim();
+	const envEffort = process.env.SYNTHETIC_SUMMARIZER_EFFORT?.trim();
+	const envMaxTokens = Number(process.env.SYNTHETIC_SUMMARIZER_MAX_TOKENS);
+	const effort = envEffort ?? SUMMARIZER_DEFAULT_REASONING_EFFORT;
+	return {
+		model: envModel || SUMMARIZER_DEFAULT_MODEL,
+		maxTokens:
+			Number.isFinite(envMaxTokens) && envMaxTokens > 0
+				? Math.min(envMaxTokens, SUMMARIZER_MAX_TOKENS_CEILING)
+				: SUMMARIZER_DEFAULT_MAX_TOKENS,
+		reasoningEffort: effort === "" || effort === "omit" || effort === "default" ? undefined : effort,
+	};
+}
 
 function truncateSnippet(text: string, maxChars: number): string {
 	if (text.length <= maxChars) return text;
@@ -159,14 +194,68 @@ function formatOutput(
 	return lines.join("\n");
 }
 
+function baseDetails(
+	query: string,
+	detailLevel: DetailLevel,
+	resultCount: number,
+	totalAvailable: number,
+): SyntheticSearchDetails {
+	return { query, detailLevel, resultCount, totalAvailable };
+}
+
+/**
+ * Apply the overall output safety net (2000 lines / 50KB). When truncated, the
+ * full text is written to a temp file and the returned text gets a read-me hint.
+ */
+async function applyTruncation(
+	formatted: string,
+	details: SyntheticSearchDetails,
+): Promise<{ text: string; details: SyntheticSearchDetails }> {
+	const truncation = truncateHead(formatted, {
+		maxLines: DEFAULT_MAX_LINES,
+		maxBytes: DEFAULT_MAX_BYTES,
+	});
+
+	let text = truncation.content;
+	if (!truncation.truncated) {
+		return { text, details };
+	}
+
+	const tempDir = await mkdtemp(join(tmpdir(), "pi-synthetic-"));
+	const tempFile = join(tempDir, "search-results.txt");
+	await withFileMutationQueue(tempFile, async () => {
+		await writeFile(tempFile, formatted, "utf8");
+	});
+
+	details.truncation = truncation;
+	details.fullOutputPath = tempFile;
+
+	const truncatedLines = truncation.totalLines - truncation.outputLines;
+	const truncatedBytes = truncation.totalBytes - truncation.outputBytes;
+
+	text += `\n\n[Output truncated: showing ${truncation.outputLines} of ${truncation.totalLines} lines`;
+	text += ` (${formatSize(truncation.outputBytes)} of ${formatSize(truncation.totalBytes)}).`;
+	text += ` ${truncatedLines} lines (${formatSize(truncatedBytes)}) omitted.`;
+	text += ` Full output saved to: ${tempFile} — use the read tool to view it.]`;
+
+	return { text, details };
+}
+
 function formatResultsForSummarizer(results: SearchResult[]): string {
 	const lines: string[] = [];
+	let budget = SUMMARIZER_MAX_TOTAL_CHARS;
 	for (const r of results) {
+		const content = truncateSnippet(r.text ?? "", Math.min(SUMMARIZER_MAX_CHARS_PER_RESULT, budget));
+		budget -= content.length;
 		lines.push(`Title: ${r.title}`);
 		lines.push(`URL: ${r.url}`);
 		if (r.published) lines.push(`Published: ${formatDate(r.published)}`);
-		lines.push(`Content: ${r.text}`);
+		lines.push(`Content: ${content}`);
 		lines.push("---");
+		if (budget <= 0) {
+			lines.push("(remaining results omitted: summarizer input budget exhausted)");
+			break;
+		}
 	}
 	return lines.join("\n");
 }
@@ -177,82 +266,126 @@ async function summarizeResults(
 	summaryPrompt: string | undefined,
 	apiKey: string,
 	signal?: AbortSignal,
-): Promise<{ summary: string; usage: { promptTokens: number; completionTokens: number } }> {
+): Promise<{
+	summary: string;
+	usage: { promptTokens: number; completionTokens: number };
+	model: string;
+}> {
+	const config = readSummarizerConfig();
+
 	let userContent = `Search query: ${query}\n\n`;
 	if (summaryPrompt) {
 		userContent += `User context: ${summaryPrompt}\n\n`;
 	}
 	userContent += `Search results:\n${formattedResults}\n\nExtract the information most relevant to the query${summaryPrompt ? " and user context" : ""}. Focus on actionable details, code snippets, and specific facts.`;
 
-	let response: Response;
-	try {
-		response = await fetch(SYNTHETIC_CHAT_ENDPOINT, {
-			method: "POST",
-			headers: {
-				Authorization: `Bearer ${apiKey}`,
-				"Content-Type": "application/json",
-			},
-			body: JSON.stringify({
-				model: SUMMARIZER_MODEL,
-				max_tokens: SUMMARIZER_MAX_TOKENS,
-				temperature: 0.3,
-				reasoning_effort: SUMMARIZER_REASONING_EFFORT,
-				messages: [
-					{ role: "system", content: SUMMARIZER_SYSTEM_PROMPT },
-					{ role: "user", content: userContent },
-				],
-			}),
-			signal,
-		});
-	} catch (err) {
-		if ((err as Error).name === "AbortError") {
-			throw new Error("Summarization request was cancelled.");
+	// Two attempts: primary config, then a no-reasoning retry. Reasoning models can
+	// exhaust the token budget on `reasoning_content` and return empty `content`.
+	const attempts: Array<{
+		maxTokens: number;
+		reasoningEffort: string | undefined;
+		why: string;
+	}> = [
+		{ maxTokens: config.maxTokens, reasoningEffort: config.reasoningEffort, why: "primary" },
+		{ maxTokens: Math.min(config.maxTokens * 2, SUMMARIZER_MAX_TOKENS_CEILING), reasoningEffort: undefined, why: "retry" },
+	];
+
+	let lastError: Error | undefined;
+	for (const attempt of attempts) {
+		const body: Record<string, unknown> = {
+			model: config.model,
+			max_tokens: attempt.maxTokens,
+			temperature: 0.3,
+			messages: [
+				{ role: "system", content: SUMMARIZER_SYSTEM_PROMPT },
+				{ role: "user", content: userContent },
+			],
+		};
+		if (attempt.reasoningEffort) {
+			body.reasoning_effort = attempt.reasoningEffort;
 		}
-		throw new Error(
-			`Summarizer network error: ${(err as Error).message}. Check your internet connection.`,
+
+		let response: Response;
+		try {
+			response = await fetch(SYNTHETIC_CHAT_ENDPOINT, {
+				method: "POST",
+				headers: {
+					Authorization: `Bearer ${apiKey}`,
+					"Content-Type": "application/json",
+				},
+				body: JSON.stringify(body),
+				signal,
+			});
+		} catch (err) {
+			if ((err as Error).name === "AbortError") {
+				throw new Error("Summarization request was cancelled.");
+			}
+			// Network errors are not worth retrying with different params.
+			throw new Error(
+				`Summarizer network error: ${(err as Error).message}. Check your internet connection.`,
+			);
+		}
+
+		if (!response.ok) {
+			const errorBody = await response.text().catch(() => "");
+			switch (response.status) {
+				case 401:
+					throw new Error(
+						`Summarizer API returned 401 Unauthorized. Check your SYNTHETIC_API_KEY. ${errorBody}`,
+					);
+				case 429:
+					throw new Error(
+						`Summarizer API rate limit exceeded (429). Wait a moment and try again. ${errorBody}`,
+					);
+				default: {
+					// A 4xx on the primary attempt usually means bad params (e.g. the model
+					// rejected reasoning_effort) — retry once without it before giving up.
+					const retryable =
+						attempt.why === "primary" && response.status >= 400 && response.status < 500;
+					const message = `Summarizer API request failed (${response.status}): ${errorBody || response.statusText}`;
+					if (retryable) {
+						lastError = new Error(message);
+						continue;
+					}
+					throw new Error(message);
+				}
+			}
+		}
+
+		let data: {
+			choices?: Array<{ finish_reason?: string; message?: { content?: string | null } }>;
+			usage?: { prompt_tokens?: number; completion_tokens?: number };
+		};
+		try {
+			data = (await response.json()) as typeof data;
+		} catch {
+			lastError = new Error("Summarizer API returned invalid JSON.");
+			if (attempt.why === "primary") continue;
+			throw lastError;
+		}
+
+		const choice = data.choices?.[0];
+		const content = choice?.message?.content?.trim();
+		if (content) {
+			return {
+				summary: content,
+				usage: {
+					promptTokens: data.usage?.prompt_tokens ?? 0,
+					completionTokens: data.usage?.completion_tokens ?? 0,
+				},
+				model: config.model,
+			};
+		}
+
+		const finish = choice?.finish_reason ?? "unknown";
+		lastError = new Error(
+			finish === "length"
+				? `Summarizer hit the ${attempt.maxTokens}-token output limit before writing an answer (finish_reason=length, empty content). Model may be spending the budget on reasoning.`
+				: `Summarizer returned no content (finish_reason=${finish}).`,
 		);
 	}
 
-	if (!response.ok) {
-		const errorBody = await response.text().catch(() => "");
-		switch (response.status) {
-			case 401:
-				throw new Error(
-					`Summarizer API returned 401 Unauthorized. Check your SYNTHETIC_API_KEY. ${errorBody}`,
-				);
-			case 429:
-				throw new Error(
-					`Summarizer API rate limit exceeded (429). Wait a moment and try again. ${errorBody}`,
-				);
-			default:
-				throw new Error(
-					`Summarizer API request failed (${response.status}): ${errorBody || response.statusText}`,
-				);
-		}
-	}
-
-	let data: {
-		choices?: Array<{ message?: { content?: string | null } }>;
-		usage?: { prompt_tokens?: number; completion_tokens?: number };
-	};
-	try {
-		data = (await response.json()) as typeof data;
-	} catch {
-		throw new Error("Summarizer API returned invalid JSON.");
-	}
-
-	const content = data.choices?.[0]?.message?.content;
-	if (!content) {
-		throw new Error("Summarizer returned empty content. Try again with detail_level='full'.");
-	}
-
-	return {
-		summary: content,
-		usage: {
-			promptTokens: data.usage?.prompt_tokens ?? 0,
-			completionTokens: data.usage?.completion_tokens ?? 0,
-		},
-	};
+	throw lastError ?? new Error("Summarizer returned no content.");
 }
 
 // ---------------------------------------------------------------------------
@@ -291,6 +424,7 @@ export default function syntheticSearchExtension(pi: ExtensionAPI) {
 			// --- Stream progress ---
 			onUpdate?.({
 				content: [{ type: "text", text: `Searching for "${query}"...` }],
+				details: undefined,
 			});
 
 			// --- Call API ---
@@ -369,103 +503,69 @@ export default function syntheticSearchExtension(pi: ExtensionAPI) {
 				// Stream progress: summarizing
 				onUpdate?.({
 					content: [{ type: "text", text: `Summarizing ${results.length} results...` }],
+					details: undefined,
 				});
 
 				const formattedForSummarizer = formatResultsForSummarizer(results);
-				const { summary, usage } = await summarizeResults(
-					query,
-					formattedForSummarizer,
-					params.summary_prompt,
-					apiKey,
-					signal,
-				);
+				try {
+					const { summary, usage, model } = await summarizeResults(
+						query,
+						formattedForSummarizer,
+						params.summary_prompt,
+						apiKey,
+						signal,
+					);
 
-				// Format the AI summary as the output
-				const formatted = `AI Summary for "${query}" (${results.length} of ${totalAvailable} results, detail: ai-summary):\n\n${summary}`;
+					// Format the AI summary as the output
+					const formatted = `AI Summary for "${query}" (${results.length} of ${totalAvailable} results, detail: ai-summary):\n\n${summary}`;
 
-				// Overall truncation (safety net — summaries should be well under limits)
-				const truncation = truncateHead(formatted, {
-					maxLines: DEFAULT_MAX_LINES,
-					maxBytes: DEFAULT_MAX_BYTES,
-				});
+					const resultText = await applyTruncation(formatted, baseDetails(query, "ai-summary", results.length, totalAvailable));
 
-				const details: SyntheticSearchDetails = {
-					query,
-					detailLevel: "ai-summary",
-					resultCount: results.length,
-					totalAvailable,
-					summaryPrompt: params.summary_prompt,
-					summarizerUsage: usage,
-				};
-
-				let resultText = truncation.content;
-
-				if (truncation.truncated) {
-					const tempDir = await mkdtemp(join(tmpdir(), "pi-synthetic-"));
-					const tempFile = join(tempDir, "search-results.txt");
-					await withFileMutationQueue(tempFile, async () => {
-						await writeFile(tempFile, formatted, "utf8");
+					return {
+						content: [{ type: "text", text: resultText.text }],
+						details: {
+							...resultText.details,
+							summaryPrompt: params.summary_prompt,
+							summarizerUsage: usage,
+							summarizerModel: model,
+						},
+					};
+				} catch (err) {
+					// Never fail the whole search because summarization broke — the raw
+					// results are still useful. Surface the error and fall back to full text.
+					if ((err as Error).message === "Summarization request was cancelled.") {
+						throw err;
+					}
+					const reason = (err as Error).message;
+					onUpdate?.({
+						content: [{ type: "text", text: "Summarizer failed, returning full results..." }],
+						details: undefined,
 					});
 
-					details.truncation = truncation;
-					details.fullOutputPath = tempFile;
+					const fallback = formatOutput(query, results, totalAvailable, "full");
+					const notice = `⚠ AI summary unavailable (${reason})\nFalling back to raw results below.\n\n`;
+					const fallbackDetails = baseDetails(query, "ai-summary", results.length, totalAvailable);
+					fallbackDetails.summaryPrompt = params.summary_prompt;
+					fallbackDetails.summarizerFallback = { error: reason };
+					const resultText = await applyTruncation(notice + fallback, fallbackDetails);
 
-					const truncatedLines = truncation.totalLines - truncation.outputLines;
-					const truncatedBytes = truncation.totalBytes - truncation.outputBytes;
-
-					resultText += `\n\n[Output truncated: showing ${truncation.outputLines} of ${truncation.totalLines} lines`;
-					resultText += ` (${formatSize(truncation.outputBytes)} of ${formatSize(truncation.totalBytes)}).`;
-					resultText += ` ${truncatedLines} lines (${formatSize(truncatedBytes)}) omitted.`;
-					resultText += ` Full output saved to: ${tempFile} — use the read tool to view it.]`;
+					return {
+						content: [{ type: "text", text: resultText.text }],
+						details: resultText.details,
+					};
 				}
-
-				return {
-					content: [{ type: "text", text: resultText }],
-					details,
-				};
 			}
 
 			// --- Standard path: format with detail_level (per-result truncation happens inside formatResult) ---
 			const formatted = formatOutput(query, results, totalAvailable, detailLevel);
-
-			// --- Overall output truncation (safety net) ---
-			const truncation = truncateHead(formatted, {
-				maxLines: DEFAULT_MAX_LINES,
-				maxBytes: DEFAULT_MAX_BYTES,
-			});
-
-			const details: SyntheticSearchDetails = {
-				query,
-				detailLevel,
-				resultCount: results.length,
-				totalAvailable,
-			};
-
-			let resultText = truncation.content;
-
-			if (truncation.truncated) {
-				// Save full formatted output to temp file
-				const tempDir = await mkdtemp(join(tmpdir(), "pi-synthetic-"));
-				const tempFile = join(tempDir, "search-results.txt");
-				await withFileMutationQueue(tempFile, async () => {
-					await writeFile(tempFile, formatted, "utf8");
-				});
-
-				details.truncation = truncation;
-				details.fullOutputPath = tempFile;
-
-				const truncatedLines = truncation.totalLines - truncation.outputLines;
-				const truncatedBytes = truncation.totalBytes - truncation.outputBytes;
-
-				resultText += `\n\n[Output truncated: showing ${truncation.outputLines} of ${truncation.totalLines} lines`;
-				resultText += ` (${formatSize(truncation.outputBytes)} of ${formatSize(truncation.totalBytes)}).`;
-				resultText += ` ${truncatedLines} lines (${formatSize(truncatedBytes)}) omitted.`;
-				resultText += ` Full output saved to: ${tempFile} — use the read tool to view it.]`;
-			}
+			const resultText = await applyTruncation(
+				formatted,
+				baseDetails(query, detailLevel, results.length, totalAvailable),
+			);
 
 			return {
-				content: [{ type: "text", text: resultText }],
-				details,
+				content: [{ type: "text", text: resultText.text }],
+				details: resultText.details,
 			};
 		},
 
@@ -511,6 +611,24 @@ export default function syntheticSearchExtension(pi: ExtensionAPI) {
 				return new Text(theme.fg("dim", "⚠ No results"), 0, 0);
 			}
 
+			// Summarizer failed but raw results were returned
+			if (details.summarizerFallback) {
+				let text = theme.fg("warning", `⚠ summary failed — ${details.resultCount} raw results`);
+				if (expanded) {
+					text += `\n${theme.fg("dim", details.summarizerFallback.error)}`;
+					const content = result.content[0];
+					if (content?.type === "text") {
+						for (const line of content.text.split("\n").slice(0, 20)) {
+							text += `\n${theme.fg("dim", line)}`;
+						}
+					}
+				}
+				if (details.fullOutputPath) {
+					text += `\n${theme.fg("dim", `Full output: ${details.fullOutputPath}`)}`;
+				}
+				return new Text(text, 0, 0);
+			}
+
 			// Collapsed: compact summary
 			let text =
 				details.detailLevel === "ai-summary"
@@ -521,6 +639,9 @@ export default function syntheticSearchExtension(pi: ExtensionAPI) {
 			}
 			if (details.detailLevel === "ai-summary" && details.summarizerUsage) {
 				text += theme.fg("dim", ` (${details.summarizerUsage.completionTokens} tokens)`);
+				if (details.summarizerModel && expanded) {
+					text += theme.fg("dim", ` [${details.summarizerModel}]`);
+				}
 			}
 			if (details.truncation?.truncated) {
 				text += theme.fg("warning", " (truncated)");
